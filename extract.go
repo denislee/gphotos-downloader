@@ -2,6 +2,8 @@ package main
 
 import (
 	"archive/zip"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -48,7 +50,7 @@ func extractZip(zipPath, destBaseDir string) (media []ExtractedMedia, totalEntri
 	}
 
 	base := strings.TrimSuffix(filepath.Base(zipPath), ".zip")
-	outDir := filepath.Join(destBaseDir, base)
+	outDir := uniqueDir(filepath.Join(destBaseDir, base))
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, 0, err
 	}
@@ -98,6 +100,27 @@ func extractZip(zipPath, destBaseDir string) (media []ExtractedMedia, totalEntri
 		}
 	}
 	return media, totalEntries, nil
+}
+
+// uniqueDir returns `path` if nothing exists at it, otherwise `path` with
+// a short random hex suffix (`path-a3f9b2`) that doesn't yet exist. Used
+// to keep each extraction in its own folder even when a prior run already
+// produced one with the same name. The suffix is space-free so the path
+// stays shell-friendly.
+func uniqueDir(path string) string {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return path
+	}
+	for {
+		var b [3]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			panic(fmt.Errorf("uniqueDir: rand.Read: %w", err))
+		}
+		cand := fmt.Sprintf("%s-%s", path, hex.EncodeToString(b[:]))
+		if _, err := os.Stat(cand); errors.Is(err, os.ErrNotExist) {
+			return cand
+		}
+	}
 }
 
 // uniquePath returns `path` if no file exists at it, otherwise the first
