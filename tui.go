@@ -354,7 +354,34 @@ func (m *model) runFlow() {
 				}
 				return
 			}
-			break // library exhausted
+			// Double-check exhaustion: a long trash sequence sometimes
+			// leaves Google Photos with a stale virtualized grid that
+			// reports zero new photos even when the library still has
+			// more. Force a hard reload and re-attempt one batch before
+			// declaring the run done.
+			m.send(logMsg{line: fmt.Sprintf("batch %d: SelectBatch returned 0 — refreshing grid to confirm library is really exhausted...", batchNum)})
+			if err := m.scraper.RefreshGrid(2 * time.Minute); err != nil {
+				m.send(logMsg{line: fmt.Sprintf("warn: refresh during exhaustion check failed: %v — trusting the empty result", err)})
+				break
+			}
+			// Give Google a beat to settle after the reload; a
+			// SelectBatch immediately after navigate sometimes still
+			// reads the in-flight loading state.
+			time.Sleep(2 * time.Second)
+			res2, err := m.scraper.SelectBatch(doneFilter, batchSize, func(c int) {
+				m.send(selectProgressMsg{scrolled: totalSelected + c})
+			})
+			if err != nil {
+				m.send(logMsg{line: fmt.Sprintf("warn: re-select after refresh failed: %v — treating library as exhausted", err)})
+				break
+			}
+			if len(res2.IDs) == 0 {
+				m.send(logMsg{line: fmt.Sprintf("confirmed: library exhausted (post-refresh saw %d photos, %d already done)", res2.TotalSeen, res2.SkippedDone)})
+				break
+			}
+			m.send(logMsg{line: fmt.Sprintf("recovered: post-refresh found %d more photos — continuing", len(res2.IDs))})
+			res = res2
+			ids = res.IDs
 		}
 		totalSelected += len(ids)
 		m.send(selectDoneMsg{count: totalSelected})
@@ -487,7 +514,17 @@ func (m *model) runFlow() {
 			}
 
 			if totalMedia < expected && m.cfg.TrashAfter {
-				m.send(logMsg{line: fmt.Sprintf("lossy: extracted %d media files of %d selected — trashing only the %d we have on disk; the other %d remain in Google for a future batch", totalMedia, expected, len(trashIDs), expected-totalMedia)})
+				const grace = 5 * time.Second
+				m.send(logMsg{line: fmt.Sprintf(
+					"!! LOSSY TRASH GATE: extracted %d of %d expected media files — about to trash %d items in %s. Press Ctrl+C now to abort if this looks wrong (the missing %d remain safe in Google).",
+					totalMedia, expected, len(trashIDs), grace, expected-totalMedia)})
+				select {
+				case <-m.ctx.Done():
+					m.send(errMsg{err: m.ctx.Err()})
+					return
+				case <-time.After(grace):
+				}
+				m.send(logMsg{line: fmt.Sprintf("lossy: proceeding to trash %d photos; the other %d remain in Google for a future batch", len(trashIDs), expected-totalMedia)})
 			} else if totalMedia < len(ids) {
 				m.send(logMsg{line: fmt.Sprintf("warn: extracted %d media files (toolbar showed %d selected; we clicked %d)", totalMedia, res.ToolbarCount, len(ids))})
 			}
@@ -540,6 +577,20 @@ func (m *model) runFlow() {
 			if err := m.scraper.TrashSelection(); err != nil {
 				m.send(errMsg{err: fmt.Errorf("batch %d trash: %w", batchNum, err)})
 				return
+			}
+			// Post-trash verification: poll the grid until trashed IDs no
+			// longer appear. Surfaces "trash confirm got dismissed without
+			// committing" as a warning rather than a silent failure where
+			// the next batch picks up the same photos again.
+			remaining, err := m.scraper.VerifyTrashed(trashIDs, 8*time.Second)
+			if err != nil {
+				m.send(logMsg{line: fmt.Sprintf("warn: post-trash check failed: %v", err)})
+			} else if len(remaining) > 0 {
+				m.send(logMsg{line: fmt.Sprintf(
+					"warn: %d of %d trashed photos still appear in the grid — trash may not have committed",
+					len(remaining), len(trashIDs))})
+			} else {
+				m.send(logMsg{line: fmt.Sprintf("batch %d: confirmed %d photos removed from grid", batchNum, len(trashIDs))})
 			}
 		} else {
 			if err := m.scraper.ClearSelection(); err != nil {
@@ -683,13 +734,82 @@ func (m *model) watchDownloads(outputDir string) ([]string, error) {
 				int((idleAfter - idleNotifyAfter).Seconds()))})
 		}
 		if !anyInProgress && time.Since(lastChange) > idleAfter {
+			// Double-check: hold for a short confirmation window and
+			// re-scan. If any zip's size grew, a new file appeared, or a
+			// `.crdownload` reappeared (Google sometimes flushes a second
+			// part after a long pause), reset and keep watching. This
+			// catches the "looks done but isn't" case where Chrome had
+			// momentarily stopped writing.
+			const confirmWait = 3 * time.Second
+			m.send(logMsg{line: fmt.Sprintf(
+				"download appears complete — re-checking for %s to confirm no late writes...",
+				confirmWait)})
+			if changed, err := m.recheckStable(outputDir, sizes, snapshot, startedAt, confirmWait); err != nil {
+				return nil, err
+			} else if changed {
+				lastChange = time.Now()
+				notifiedIdle = false
+				continue
+			}
 			completed := make([]string, 0, len(sizes))
 			for name := range sizes {
 				if !strings.HasSuffix(name, ".crdownload") {
 					completed = append(completed, name)
 				}
 			}
+			m.send(logMsg{line: fmt.Sprintf("download confirmed stable: %d zip(s)", len(completed))})
 			return completed, nil
+		}
+	}
+}
+
+// recheckStable holds for `wait` and verifies that the set of in-flight
+// downloads hasn't changed: no new file in the watched directory, no zip
+// growing, and no `.crdownload` reappearing. Returns true if anything moved
+// during the window (caller should keep watching) or false if everything was
+// stable (caller can return).
+func (m *model) recheckStable(outputDir string, sizes map[string]int64, snapshot map[string]int64, startedAt time.Time, wait time.Duration) (bool, error) {
+	const tick = 250 * time.Millisecond
+	deadline := time.Now().Add(wait)
+	for {
+		select {
+		case <-m.ctx.Done():
+			return false, m.ctx.Err()
+		case <-time.After(tick):
+		}
+		entries, err := os.ReadDir(outputDir)
+		if err != nil {
+			return false, fmt.Errorf("recheck read dir: %w", err)
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			// Same filter as watchDownloads: only files that belong to this watch.
+			if _, existed := snapshot[name]; existed && !info.ModTime().After(startedAt) {
+				continue
+			}
+			if strings.HasSuffix(name, ".crdownload") {
+				m.send(logMsg{line: fmt.Sprintf("recheck: %s reappeared in flight — keeping watch", name)})
+				return true, nil
+			}
+			prev, known := sizes[name]
+			if !known {
+				m.send(logMsg{line: fmt.Sprintf("recheck: new file %s appeared — keeping watch", name)})
+				return true, nil
+			}
+			if info.Size() != prev {
+				m.send(logMsg{line: fmt.Sprintf("recheck: %s size changed (%d → %d) — keeping watch", name, prev, info.Size())})
+				return true, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return false, nil
 		}
 	}
 }

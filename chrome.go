@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/chromedp/cdproto/browser"
@@ -1075,6 +1076,75 @@ func (s *Scraper) diagnoseAfterSelect() string {
 	var s2 string
 	_ = chromedp.Run(s.browserCtx, chromedp.Evaluate(js, &s2))
 	return s2
+}
+
+// RefreshGrid forces a hard reload of photos.google.com and re-waits for
+// the grid to render. Used as a sanity check before concluding the library
+// is exhausted: if a batch returned zero selectable photos but a reload
+// surfaces fresh thumbnails, the previous run was looking at a stale
+// virtualized DOM (often after a long trash sequence where Google hadn't
+// fully repaginated) rather than a genuinely empty library.
+func (s *Scraper) RefreshGrid(timeout time.Duration) error {
+	if err := chromedp.Run(s.browserCtx, chromedp.Navigate("https://photos.google.com/")); err != nil {
+		return fmt.Errorf("refresh navigate: %w", err)
+	}
+	// Give the SPA a moment to mount before waitForGrid starts polling;
+	// otherwise the first poll can race the framework and read a stale
+	// thumbnail count from the previous view.
+	time.Sleep(1500 * time.Millisecond)
+	return s.waitForGrid(timeout)
+}
+
+// VerifyTrashed polls the photos grid DOM for up to `timeout` until none
+// of `ids` appear as `a[href*="/photo/<id>"]` links. Returns the slice of
+// IDs that are still visible when the timeout expires (empty == fully
+// trashed). The check is purely DOM-based: Google Photos removes a photo's
+// thumbnail link from the grid almost immediately after a successful trash
+// confirm, so if any IDs persist past a few seconds it usually means the
+// trash never went through (e.g. confirm dialog was dismissed without
+// committing).
+func (s *Scraper) VerifyTrashed(ids []string, timeout time.Duration) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	// Build the JS check once. We pass IDs in as a JSON-encoded literal
+	// rather than interpolating to keep escaping safe even for IDs with
+	// unusual characters.
+	idLits := make([]string, 0, len(ids))
+	for _, id := range ids {
+		// IDs are alphanumeric in practice; defensively quote.
+		idLits = append(idLits, `"`+id+`"`)
+	}
+	js := fmt.Sprintf(`(() => {
+		const ids = [%s];
+		const remaining = [];
+		for (const id of ids) {
+			const a = document.querySelector('a[href*="/photo/' + id + '"]');
+			if (a) {
+				const r = a.getBoundingClientRect();
+				if (r.width > 0 && r.height > 0) remaining.push(id);
+			}
+		}
+		return remaining;
+	})()`, strings.Join(idLits, ","))
+
+	deadline := time.Now().Add(timeout)
+	var remaining []string
+	for {
+		if err := s.browserCtx.Err(); err != nil {
+			return nil, err
+		}
+		if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(js, &remaining)); err != nil {
+			return nil, err
+		}
+		if len(remaining) == 0 {
+			return nil, nil
+		}
+		if time.Now().After(deadline) {
+			return remaining, nil
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
 }
 
 // ClearSelection sends Escape to drop the current selection so the next batch

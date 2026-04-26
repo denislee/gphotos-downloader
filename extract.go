@@ -38,6 +38,11 @@ type ExtractedMedia struct {
 // did we successfully download", not just a count) and the total number
 // of zip entries seen. Any path that would escape the target folder
 // (zip-slip) is rejected.
+//
+// Before writing anything to disk, verifyZip is called to walk every
+// entry's deflate stream end-to-end. A truncated or corrupt zip surfaces
+// as an error here rather than as a half-extracted folder we'd then trash
+// the originals against.
 func extractZip(zipPath, destBaseDir string) (media []ExtractedMedia, totalEntries int, err error) {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -47,6 +52,10 @@ func extractZip(zipPath, destBaseDir string) (media []ExtractedMedia, totalEntri
 
 	if len(r.File) == 0 {
 		return nil, 0, fmt.Errorf("zip %s is empty", zipPath)
+	}
+
+	if err := verifyZip(&r.Reader, zipPath); err != nil {
+		return nil, 0, err
 	}
 
 	base := strings.TrimSuffix(filepath.Base(zipPath), ".zip")
@@ -174,6 +183,35 @@ func writeBatchManifest(baseDir string, batchNum int, clickedIDs []string, media
 	fmt.Fprintln(f, "[extracted-files]")
 	for i, mm := range media {
 		fmt.Fprintf(f, "%d\t%s\t%s\n", i, mm.Name, mm.Path)
+	}
+	return nil
+}
+
+// verifyZip reads every entry's compressed stream end-to-end so the
+// archive's CRC32 checksums (verified by archive/zip on Close of each
+// entry reader) are checked before we commit any bytes to disk. A
+// truncated zip — common when a download partially completed but the
+// watcher returned anyway — fails here with `unexpected EOF` or a CRC
+// mismatch, and the caller aborts the batch rather than half-extracting.
+func verifyZip(r *zip.Reader, zipPath string) error {
+	for _, f := range r.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return fmt.Errorf("verify %s: open entry %s: %w", zipPath, f.Name, err)
+		}
+		if _, err := io.Copy(io.Discard, rc); err != nil {
+			rc.Close()
+			return fmt.Errorf("verify %s: read entry %s: %w", zipPath, f.Name, err)
+		}
+		// Closing the entry reader is what triggers archive/zip's CRC32
+		// check against the local file header — silently skipping this
+		// would let a corrupt zip pass verification.
+		if err := rc.Close(); err != nil {
+			return fmt.Errorf("verify %s: close entry %s (CRC mismatch?): %w", zipPath, f.Name, err)
+		}
 	}
 	return nil
 }
