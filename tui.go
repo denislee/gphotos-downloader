@@ -633,12 +633,28 @@ func (m *model) runFlow() {
 						continue
 					}
 					if n == 0 {
-						// No pending IDs are still in the grid — they
-						// disappeared between attempts, which means a prior
-						// trash click did commit after all.
-						m.send(logMsg{line: fmt.Sprintf("batch %d: no remaining photos to reselect — assuming trash committed", batchNum)})
-						trashSucceeded = true
-						break
+						// SelectByIDs couldn't find the pending IDs in the
+						// grid. That *usually* means a prior trash click
+						// committed after all — but it can also mean the
+						// grid hasn't loaded those rows yet. Confirm via
+						// DOM check before treating this batch as done,
+						// otherwise we move on to a new selection while
+						// the previous trash is still uncommitted.
+						remaining, err := m.scraper.VerifyTrashed(pendingTrash, 8*time.Second)
+						if err != nil {
+							lastTrashErr = fmt.Errorf("post-reselect verify: %w", err)
+							m.send(logMsg{line: fmt.Sprintf("warn: trash retry %d/%d post-reselect verify failed: %v", attempt, maxTrashAttempts, err)})
+							continue
+						}
+						if len(remaining) == 0 {
+							m.send(logMsg{line: fmt.Sprintf("batch %d: confirmed trash committed (none of %d IDs visible in grid)", batchNum, len(pendingTrash))})
+							trashSucceeded = true
+							break
+						}
+						m.send(logMsg{line: fmt.Sprintf("warn: reselect found 0 but %d of %d IDs still in DOM — retrying trash", len(remaining), len(pendingTrash))})
+						pendingTrash = remaining
+						lastTrashErr = fmt.Errorf("reselect missed but %d IDs still in grid", len(remaining))
+						continue
 					}
 					m.send(logMsg{line: fmt.Sprintf("batch %d: trash retry %d/%d on %d remaining photos", batchNum, attempt, maxTrashAttempts, n)})
 				}
