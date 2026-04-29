@@ -1275,17 +1275,107 @@ func (s *Scraper) diagnoseAfterSelect() string {
 // surfaces fresh thumbnails, the previous run was looking at a stale
 // virtualized DOM (often after a long trash sequence where Google hadn't
 // fully repaginated) rather than a genuinely empty library.
+//
+// Post-trash, Google Photos commonly renders the grid twice: an initial
+// pass from cached state (often still showing the just-trashed items),
+// then a re-render once the trash sync propagates and those thumbnails
+// drop out. waitForGrid alone returns as soon as *any* thumbnail link is
+// present, so a SelectBatch firing immediately after can latch onto the
+// stale leading thumbnails. After the grid first appears, we additionally
+// poll until the leading-thumbnail signature is stable for ~2s before
+// returning.
 func (s *Scraper) RefreshGrid(timeout time.Duration) error {
 	s.log("RefreshGrid: hard reload of photos.google.com")
+	start := time.Now()
 	if err := chromedp.Run(s.browserCtx, chromedp.Navigate("https://photos.google.com/")); err != nil {
 		s.log("RefreshGrid: navigate error: %v", err)
 		return fmt.Errorf("refresh navigate: %w", err)
 	}
-	// Give the SPA a moment to mount before waitForGrid starts polling;
-	// otherwise the first poll can race the framework and read a stale
-	// thumbnail count from the previous view.
+	// Wait for document.readyState=='complete' so the SPA has actually
+	// mounted before we start probing. Capped low because Google Photos
+	// reaches readyState=complete fast even when the grid hasn't drawn yet.
+	if err := s.waitForReadyState(5 * time.Second); err != nil {
+		s.log("RefreshGrid: readyState wait: %v (continuing)", err)
+	}
+	// Give the SPA a moment past readyState=complete so React/Closure can
+	// wire up before waitForGrid starts polling.
 	time.Sleep(1500 * time.Millisecond)
-	return s.waitForGrid(timeout)
+	if err := s.waitForGrid(timeout); err != nil {
+		return err
+	}
+	remaining := max(timeout-time.Since(start), 5*time.Second)
+	return s.waitForGridStable(remaining)
+}
+
+// waitForReadyState polls until document.readyState === 'complete'.
+func (s *Scraper) waitForReadyState(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := s.browserCtx.Err(); err != nil {
+			return err
+		}
+		var ready string
+		if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(`document.readyState`, &ready)); err == nil && ready == "complete" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("document.readyState !== complete within %s", timeout)
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+// waitForGridStable polls the leading-thumbnail signature (count + first 10
+// photo IDs) and returns once it has been unchanged for `stableNeeded`
+// consecutive polls (~2s). Catches the post-trash SPA re-render where the
+// initial render shows stale leading items that vanish once the trash sync
+// propagates. Returns nil on timeout (best-effort) — the caller still has
+// other defenses against stale thumbnails.
+func (s *Scraper) waitForGridStable(timeout time.Duration) error {
+	const sigJS = `(() => {
+		const links = document.querySelectorAll('a[href*="/photo/"]');
+		const ids = [];
+		for (let i = 0; i < links.length && ids.length < 10; i++) {
+			const m = links[i].getAttribute('href').match(/\/photo\/([^\/?#]+)/);
+			if (m) ids.push(m[1]);
+		}
+		return links.length + '|' + ids.join(',');
+	})()`
+	const stableNeeded = 5 // 5 * 400ms ≈ 2s of stable signature
+	s.log("waitForGridStable: polling for stable grid signature (timeout=%s)", timeout)
+	deadline := time.Now().Add(timeout)
+	var lastSig string
+	stable := 0
+	iter := 0
+	for {
+		iter++
+		if err := s.browserCtx.Err(); err != nil {
+			return err
+		}
+		var sig string
+		if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(sigJS, &sig)); err != nil {
+			s.log("waitForGridStable: signature query failed: %v", err)
+			return nil
+		}
+		if sig == lastSig && sig != "" {
+			stable++
+			if stable >= stableNeeded {
+				s.log("waitForGridStable: grid stable after %d polls (sig=%q)", iter, sig)
+				return nil
+			}
+		} else {
+			if lastSig != "" {
+				s.log("waitForGridStable: signature changed at poll %d (%q -> %q)", iter, lastSig, sig)
+			}
+			stable = 0
+			lastSig = sig
+		}
+		if time.Now().After(deadline) {
+			s.log("waitForGridStable: timeout after %s — proceeding with current grid (sig=%q)", timeout, sig)
+			return nil
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
 }
 
 // VerifyTrashed polls the photos grid DOM for up to `timeout` until none
