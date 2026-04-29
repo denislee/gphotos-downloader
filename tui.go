@@ -669,6 +669,19 @@ func (m *model) runFlow() {
 				return
 			}
 			m.send(logMsg{line: fmt.Sprintf("batch %d: confirmed %d photos removed from grid", batchNum, len(trashIDs))})
+			// The "Movendo para a lixeira" snackbar stays visible for the
+			// duration of the server-side delete. Reloading or starting the
+			// next selection while it's still up races the delete and the
+			// new grid can come back showing stale thumbnails. Wait it out,
+			// then hard-reload so the next batch starts from a clean grid.
+			m.send(logMsg{line: fmt.Sprintf("batch %d: waiting for trash toast to clear before reloading", batchNum)})
+			if err := m.scraper.WaitForTrashToastGone(60 * time.Second); err != nil {
+				m.send(logMsg{line: fmt.Sprintf("warn: waiting for trash toast: %v", err)})
+			}
+			m.send(logMsg{line: fmt.Sprintf("batch %d: reloading photos.google.com before next selection", batchNum)})
+			if err := m.scraper.RefreshGrid(2 * time.Minute); err != nil {
+				m.send(logMsg{line: fmt.Sprintf("warn: post-trash reload failed: %v", err)})
+			}
 		} else {
 			if err := m.scraper.ClearSelection(); err != nil {
 				m.send(logMsg{line: fmt.Sprintf("warn: clear selection failed: %v", err)})

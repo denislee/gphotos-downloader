@@ -974,6 +974,79 @@ func (s *Scraper) TrashSelection() error {
 	return nil
 }
 
+// WaitForTrashToastGone waits for Google Photos' "Moving to trash" /
+// "Movendo para a lixeira" snackbar to disappear. The toast is shown for
+// the duration of the actual server-side delete, and reloading the page
+// while it's still visible races the delete and can leave the grid showing
+// stale thumbnails of items that are about to vanish. Returns nil when the
+// toast is gone (or was never seen). Returns nil on timeout too — we don't
+// want a stuck toast to abort the whole run.
+func (s *Scraper) WaitForTrashToastGone(timeout time.Duration) error {
+	s.log("WaitForTrashToastGone: polling for trash toast (timeout=%s)", timeout)
+	const js = `(() => {
+		const isVisible = (el) => {
+			const r = el.getBoundingClientRect();
+			return r.width > 0 && r.height > 0;
+		};
+		// "Movendo para a lixeira" (pt) / "Moving to trash" (en) /
+		// "Moviendo a la papelera" (es) / "Déplacement vers la corbeille" (fr)
+		// / "In den Papierkorb verschieben" (de) / "Spostamento nel cestino" (it).
+		const rx = /(movendo para a lixeira|moving to trash|moving items to trash|moviendo a la papelera|déplacement vers la corbeille|verschieb\w* in den papierkorb|spostamento nel cestino|spostando nel cestino)/i;
+		const sels = [
+			'[role="alert"]', '[role="status"]',
+			'[aria-live="polite"]', '[aria-live="assertive"]',
+		];
+		const seen = new Set();
+		for (const sel of sels) {
+			for (const el of document.querySelectorAll(sel)) {
+				if (seen.has(el)) continue;
+				seen.add(el);
+				if (!isVisible(el)) continue;
+				const t = ((el.innerText || el.textContent) || '').trim();
+				if (!t) continue;
+				if (rx.test(t)) return true;
+			}
+		}
+		return false;
+	})()`
+	deadline := time.Now().Add(timeout)
+	// Phase 1: wait briefly for the toast to actually show up. If it never
+	// appears (small selection, fast confirm), there's nothing to wait on.
+	sawToast := false
+	appearDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(appearDeadline) {
+		if err := s.browserCtx.Err(); err != nil {
+			return err
+		}
+		var visible bool
+		if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(js, &visible)); err == nil && visible {
+			sawToast = true
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	if !sawToast {
+		s.log("WaitForTrashToastGone: toast never appeared within 3s — skipping wait")
+		return nil
+	}
+	// Phase 2: poll until it's gone or we hit the overall timeout.
+	for {
+		if err := s.browserCtx.Err(); err != nil {
+			return err
+		}
+		var visible bool
+		if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(js, &visible)); err == nil && !visible {
+			s.log("WaitForTrashToastGone: toast dismissed")
+			return nil
+		}
+		if time.Now().After(deadline) {
+			s.log("WaitForTrashToastGone: timeout after %s — toast still visible, proceeding anyway", timeout)
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 // toggleSelect toggles the selection state of photo `p`. Approach:
 //
 //  1. Hover the thumbnail center so the hover-revealed checkmark renders.
