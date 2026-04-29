@@ -974,13 +974,17 @@ func (s *Scraper) TrashSelection() error {
 	return nil
 }
 
-// WaitForTrashToastGone waits for Google Photos' "Moving to trash" /
-// "Movendo para a lixeira" snackbar to disappear. The toast is shown for
-// the duration of the actual server-side delete, and reloading the page
-// while it's still visible races the delete and can leave the grid showing
-// stale thumbnails of items that are about to vanish. Returns nil when the
-// toast is gone (or was never seen). Returns nil on timeout too — we don't
-// want a stuck toast to abort the whole run.
+// WaitForTrashToastGone waits for Google Photos' trash snackbar to
+// disappear. Two consecutive toasts can show up: the in-progress
+// "Movendo para a lixeira" / "Moving to trash" while the server-side
+// delete runs, and the post-delete confirmation "Movido(s) para a
+// lixeira" / "Moved to trash" with an Undo button — while either is
+// visible the trash isn't fully committed (Undo can still revert it),
+// and reloading or selecting the next batch races that state and can
+// leave the grid showing stale thumbnails of items about to vanish.
+// Returns nil when no trash toast is visible (or none ever appeared).
+// Returns nil on timeout too — we don't want a stuck toast to abort
+// the whole run.
 func (s *Scraper) WaitForTrashToastGone(timeout time.Duration) error {
 	s.log("WaitForTrashToastGone: polling for trash toast (timeout=%s)", timeout)
 	const js = `(() => {
@@ -988,10 +992,13 @@ func (s *Scraper) WaitForTrashToastGone(timeout time.Duration) error {
 			const r = el.getBoundingClientRect();
 			return r.width > 0 && r.height > 0;
 		};
-		// "Movendo para a lixeira" (pt) / "Moving to trash" (en) /
-		// "Moviendo a la papelera" (es) / "Déplacement vers la corbeille" (fr)
+		// In-progress: "Movendo para a lixeira" (pt) / "Moving to trash" (en)
+		// / "Moviendo a la papelera" (es) / "Déplacement vers la corbeille" (fr)
 		// / "In den Papierkorb verschieben" (de) / "Spostamento nel cestino" (it).
-		const rx = /(movendo para a lixeira|moving to trash|moving items to trash|moviendo a la papelera|déplacement vers la corbeille|verschieb\w* in den papierkorb|spostamento nel cestino|spostando nel cestino)/i;
+		// Post-delete (with Undo button): "Movido(s) para a lixeira" /
+		// "Moved to trash" / "Movido a la papelera" / "Déplacé vers la corbeille"
+		// / "In den Papierkorb verschoben" / "Spostato nel cestino".
+		const rx = /(movendo para a lixeira|movido[s]? para a lixeira|moving to trash|moving items to trash|moved to trash|item[s]? moved to trash|moviendo a la papelera|movido[s]? a la papelera|déplacement vers la corbeille|déplacé[s]? vers la corbeille|verschieb\w* in den papierkorb|in den papierkorb verschoben|spostamento nel cestino|spostando nel cestino|spostat[oi] nel cestino)/i;
 		const sels = [
 			'[role="alert"]', '[role="status"]',
 			'[aria-live="polite"]', '[aria-live="assertive"]',
@@ -1029,15 +1036,29 @@ func (s *Scraper) WaitForTrashToastGone(timeout time.Duration) error {
 		s.log("WaitForTrashToastGone: toast never appeared within 3s — skipping wait")
 		return nil
 	}
-	// Phase 2: poll until it's gone or we hit the overall timeout.
+	// Phase 2: poll until it's gone or we hit the overall timeout. The
+	// in-progress toast and the post-delete confirmation toast can be
+	// rendered as separate elements with a brief gap between them; require
+	// the "gone" state to hold for ~1s of consecutive polls so we don't
+	// return during the swap and start the next batch while the
+	// confirmation toast is still about to appear.
+	const stableNeeded = 4 // 4 * 300ms ≈ 1.2s
+	stableCount := 0
 	for {
 		if err := s.browserCtx.Err(); err != nil {
 			return err
 		}
 		var visible bool
-		if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(js, &visible)); err == nil && !visible {
-			s.log("WaitForTrashToastGone: toast dismissed")
-			return nil
+		if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(js, &visible)); err == nil {
+			if !visible {
+				stableCount++
+				if stableCount >= stableNeeded {
+					s.log("WaitForTrashToastGone: toast dismissed")
+					return nil
+				}
+			} else {
+				stableCount = 0
+			}
 		}
 		if time.Now().After(deadline) {
 			s.log("WaitForTrashToastGone: timeout after %s — toast still visible, proceeding anyway", timeout)
