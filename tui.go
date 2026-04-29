@@ -574,24 +574,67 @@ func (m *model) runFlow() {
 				}
 			}
 			m.send(logMsg{line: fmt.Sprintf("batch %d: moving %d photos to trash...", batchNum, len(trashIDs))})
-			if err := m.scraper.TrashSelection(); err != nil {
-				m.send(errMsg{err: fmt.Errorf("batch %d trash: %w", batchNum, err)})
+			// Retry the trash flow up to maxTrashAttempts. Each attempt:
+			//   click trash button → confirm dialog → VerifyTrashed.
+			// If any step fails (button miss, dialog dismissed without
+			// commit, photos still in grid), drop selection state, reselect
+			// only the IDs still visible in the grid, and retry. This
+			// prevents the previous failure mode where a missed trash click
+			// was silently followed by the next batch reselecting the same
+			// photos.
+			const maxTrashAttempts = 3
+			trashSucceeded := false
+			pendingTrash := append([]string(nil), trashIDs...)
+			var lastTrashErr error
+			for attempt := 1; attempt <= maxTrashAttempts; attempt++ {
+				if attempt > 1 {
+					if err := m.scraper.ClearSelection(); err != nil {
+						m.send(logMsg{line: fmt.Sprintf("warn: clear before trash retry failed: %v", err)})
+					}
+					time.Sleep(700 * time.Millisecond)
+					n, err := m.scraper.SelectByIDs(pendingTrash, nil)
+					if err != nil {
+						lastTrashErr = fmt.Errorf("reselect for trash retry: %w", err)
+						m.send(logMsg{line: fmt.Sprintf("warn: trash retry %d/%d reselect failed: %v", attempt, maxTrashAttempts, err)})
+						continue
+					}
+					if n == 0 {
+						// No pending IDs are still in the grid — they
+						// disappeared between attempts, which means a prior
+						// trash click did commit after all.
+						m.send(logMsg{line: fmt.Sprintf("batch %d: no remaining photos to reselect — assuming trash committed", batchNum)})
+						trashSucceeded = true
+						break
+					}
+					m.send(logMsg{line: fmt.Sprintf("batch %d: trash retry %d/%d on %d remaining photos", batchNum, attempt, maxTrashAttempts, n)})
+				}
+				if err := m.scraper.TrashSelection(); err != nil {
+					lastTrashErr = err
+					m.send(logMsg{line: fmt.Sprintf("warn: trash attempt %d/%d failed: %v", attempt, maxTrashAttempts, err)})
+					continue
+				}
+				remaining, err := m.scraper.VerifyTrashed(pendingTrash, 8*time.Second)
+				if err != nil {
+					lastTrashErr = err
+					m.send(logMsg{line: fmt.Sprintf("warn: post-trash check failed on attempt %d/%d: %v", attempt, maxTrashAttempts, err)})
+					continue
+				}
+				if len(remaining) == 0 {
+					trashSucceeded = true
+					lastTrashErr = nil
+					break
+				}
+				m.send(logMsg{line: fmt.Sprintf(
+					"warn: %d of %d photos still in grid after trash attempt %d/%d — will retry",
+					len(remaining), len(pendingTrash), attempt, maxTrashAttempts)})
+				pendingTrash = remaining
+				lastTrashErr = fmt.Errorf("%d photos still visible in grid after trash", len(remaining))
+			}
+			if !trashSucceeded {
+				m.send(errMsg{err: fmt.Errorf("batch %d trash failed after %d attempts: %w", batchNum, maxTrashAttempts, lastTrashErr)})
 				return
 			}
-			// Post-trash verification: poll the grid until trashed IDs no
-			// longer appear. Surfaces "trash confirm got dismissed without
-			// committing" as a warning rather than a silent failure where
-			// the next batch picks up the same photos again.
-			remaining, err := m.scraper.VerifyTrashed(trashIDs, 8*time.Second)
-			if err != nil {
-				m.send(logMsg{line: fmt.Sprintf("warn: post-trash check failed: %v", err)})
-			} else if len(remaining) > 0 {
-				m.send(logMsg{line: fmt.Sprintf(
-					"warn: %d of %d trashed photos still appear in the grid — trash may not have committed",
-					len(remaining), len(trashIDs))})
-			} else {
-				m.send(logMsg{line: fmt.Sprintf("batch %d: confirmed %d photos removed from grid", batchNum, len(trashIDs))})
-			}
+			m.send(logMsg{line: fmt.Sprintf("batch %d: confirmed %d photos removed from grid", batchNum, len(trashIDs))})
 		} else {
 			if err := m.scraper.ClearSelection(); err != nil {
 				m.send(logMsg{line: fmt.Sprintf("warn: clear selection failed: %v", err)})
