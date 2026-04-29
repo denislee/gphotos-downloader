@@ -21,6 +21,18 @@ type Scraper struct {
 	allocCancel context.CancelFunc
 	browserCtx  context.Context
 	browserCanc context.CancelFunc
+	// Logger, if non-nil, receives one-line debug messages from the
+	// scraper. The TUI wires this to its log channel so chrome.go's
+	// internal state shows up in the on-screen log and the debug.log
+	// file. Nil = silent.
+	Logger func(string)
+}
+
+func (s *Scraper) log(format string, args ...any) {
+	if s.Logger == nil {
+		return
+	}
+	s.Logger(fmt.Sprintf(format, args...))
 }
 
 func NewScraper(cfg Config, headless bool) *Scraper {
@@ -59,7 +71,9 @@ func (s *Scraper) Close() {
 // account chooser/login flow to finish. Returns nil once the user is back on
 // photos.google.com with the app shell rendered.
 func (s *Scraper) EnsureLoggedIn(timeout time.Duration) error {
+	s.log("EnsureLoggedIn: navigating to photos.google.com (timeout=%s)", timeout)
 	if err := chromedp.Run(s.browserCtx, chromedp.Navigate("https://photos.google.com/")); err != nil {
+		s.log("EnsureLoggedIn: navigate error: %v", err)
 		return err
 	}
 
@@ -71,16 +85,41 @@ func (s *Scraper) EnsureLoggedIn(timeout time.Duration) error {
 		return false;
 	})()`
 
+	const stateJS = `(() => ({
+		Host: location.host,
+		Path: location.pathname,
+		HasPhotoLink: !!document.querySelector('a[href*="/photo/"]'),
+		HasMain: !!document.querySelector('div[role="main"], c-wiz[jsrenderer]'),
+		BodyLen: (document.body ? document.body.innerText.length : 0),
+	}))()`
+
 	deadline := time.Now().Add(timeout)
+	iter := 0
 	for {
+		iter++
 		if err := s.browserCtx.Err(); err != nil {
+			s.log("EnsureLoggedIn: browser context died: %v", err)
 			return fmt.Errorf("browser context died: %w", err)
 		}
 		var ok bool
 		if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(check, &ok)); err == nil && ok {
+			s.log("EnsureLoggedIn: signed in after %d polls", iter)
 			return nil
 		}
+		// Periodic state dump so the user can see what the page looks
+		// like while we wait — a stuck login otherwise gives no signal.
+		if iter%5 == 1 {
+			var st struct {
+				Host, Path                 string
+				HasPhotoLink, HasMain      bool
+				BodyLen                    int
+			}
+			_ = chromedp.Run(s.browserCtx, chromedp.Evaluate(stateJS, &st))
+			s.log("EnsureLoggedIn: poll %d host=%s path=%s photoLink=%v main=%v bodyLen=%d",
+				iter, st.Host, st.Path, st.HasPhotoLink, st.HasMain, st.BodyLen)
+		}
 		if time.Now().After(deadline) {
+			s.log("EnsureLoggedIn: timed out after %d polls", iter)
 			return errors.New("login wait timed out")
 		}
 		time.Sleep(2 * time.Second)
@@ -118,26 +157,36 @@ type photoInfo struct {
 // scan from the top would otherwise see zero photos until the grid
 // scrolls into them on its own.
 func (s *Scraper) waitForGrid(timeout time.Duration) error {
+	s.log("waitForGrid: scrolling to top, waiting up to %s for thumbnails", timeout)
 	const scrollTopJS = `(() => {
 		window.scrollTo(0, 0);
 		if (document.scrollingElement) document.scrollingElement.scrollTo(0, 0);
 		document.querySelectorAll('[role="main"]').forEach(el => { el.scrollTop = 0; });
 	})()`
 	if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(scrollTopJS, nil)); err != nil {
+		s.log("waitForGrid: scroll-top failed: %v", err)
 		return err
 	}
 
 	const countJS = `document.querySelectorAll('a[href*="/photo/"]').length`
 	deadline := time.Now().Add(timeout)
+	iter := 0
 	for {
+		iter++
 		if err := s.browserCtx.Err(); err != nil {
+			s.log("waitForGrid: browser context died: %v", err)
 			return fmt.Errorf("browser context died: %w", err)
 		}
 		var count int
 		if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(countJS, &count)); err != nil {
+			s.log("waitForGrid: countJS failed: %v", err)
 			return err
 		}
+		if iter%4 == 1 {
+			s.log("waitForGrid: poll %d sees %d photo links", iter, count)
+		}
 		if count > 0 {
+			s.log("waitForGrid: %d photo links rendered after %d polls", count, iter)
 			// One more pass to nudge the grid to the top — sometimes the
 			// initial scroll lands before the framework has wired up its
 			// scroll container, so the second call is the one that takes.
@@ -175,6 +224,7 @@ type SelectBatchResult struct {
 }
 
 func (s *Scraper) SelectBatch(done map[string]bool, n int, progress func(selected int)) (SelectBatchResult, error) {
+	s.log("SelectBatch: target=%d done-set-size=%d noScroll=%v", n, len(done), s.cfg.NoScroll)
 	res := SelectBatchResult{IDs: make([]string, 0, n)}
 	selectedSet := make(map[string]bool, n)
 	allSeen := make(map[string]bool)
@@ -187,6 +237,7 @@ func (s *Scraper) SelectBatch(done map[string]bool, n int, progress func(selecte
 	// actually render before scanning, otherwise we'd see zero photos and
 	// give up before the grid finished loading.
 	if err := s.waitForGrid(20 * time.Second); err != nil {
+		s.log("SelectBatch: waitForGrid failed: %v", err)
 		return res, err
 	}
 
@@ -217,6 +268,8 @@ func (s *Scraper) SelectBatch(done map[string]bool, n int, progress func(selecte
 				}
 			}
 		}
+		s.log("SelectBatch: scan saw %d photo links (%d new this pass; %d total seen, %d skipped done, %d already selected)",
+			len(infos), newPhotosThisScan, res.TotalSeen, res.SkippedDone, len(selectedSet))
 
 		progressed := false
 		for _, p := range infos {
@@ -224,6 +277,7 @@ func (s *Scraper) SelectBatch(done map[string]bool, n int, progress func(selecte
 				continue
 			}
 			if err := s.toggleSelect(p, !verifiedSelectMode); err != nil {
+				s.log("SelectBatch: toggleSelect(%s) error: %v", p.ID, err)
 				return res, fmt.Errorf("select %s: %w", p.ID, err)
 			}
 			// After the very first click, confirm that Google actually
@@ -231,11 +285,13 @@ func (s *Scraper) SelectBatch(done map[string]bool, n int, progress func(selecte
 			// checkmark — bail with a clear error rather than silently
 			// "selecting" 200 photos that aren't actually selected.
 			if !verifiedSelectMode {
+				s.log("SelectBatch: verifying first click on %s entered selection mode", p.ID)
 				inMode, err := s.waitForSelectionMode(2500 * time.Millisecond)
 				if err != nil {
 					return res, fmt.Errorf("verify selection: %w", err)
 				}
 				if !inMode {
+					s.log("SelectBatch: first click on %s did NOT enter select mode — trying focus+x fallback", p.ID)
 					if err := s.focusAndPressX(p.ID); err != nil {
 						return res, fmt.Errorf("first-click fallback for %s: %w", p.ID, err)
 					}
@@ -243,13 +299,16 @@ func (s *Scraper) SelectBatch(done map[string]bool, n int, progress func(selecte
 					if err != nil {
 						return res, fmt.Errorf("verify selection: %w", err)
 					}
+					s.log("SelectBatch: focus+x fallback result inMode=%v", inMode)
 				}
 				if !inMode {
 					diag := s.diagnoseClickTarget(p)
+					s.log("SelectBatch: ABORT — first click on %s never entered selection mode — diag: %s", p.ID, diag)
 					return res, fmt.Errorf(
 						"first click on photo %s did not enter selection mode — diag: %s",
 						p.ID, diag)
 				}
+				s.log("SelectBatch: first click verified — selection mode active")
 				verifiedSelectMode = true
 			}
 			res.IDs = append(res.IDs, p.ID)
@@ -273,6 +332,7 @@ func (s *Scraper) SelectBatch(done map[string]bool, n int, progress func(selecte
 		// caller (typically with -trash) is expected to clear the
 		// viewport between batches by trashing what we just selected.
 		if s.cfg.NoScroll {
+			s.log("SelectBatch: no-scroll mode — stopping after viewport with %d selected", len(res.IDs))
 			res.HitGridBottom = true
 			break
 		}
@@ -280,6 +340,7 @@ func (s *Scraper) SelectBatch(done map[string]bool, n int, progress func(selecte
 		// Try to load more photos from the virtualized grid.
 		loaded, err := s.scrollForMore()
 		if err != nil {
+			s.log("SelectBatch: scrollForMore error: %v", err)
 			return res, err
 		}
 
@@ -291,7 +352,10 @@ func (s *Scraper) SelectBatch(done map[string]bool, n int, progress func(selecte
 		// be in the done set (so progressed=false too).
 		if !progressed && !loaded && newPhotosThisScan == 0 {
 			idleScrolls++
+			s.log("SelectBatch: idle pass %d/3 (progressed=%v loaded=%v newScan=%d)",
+				idleScrolls, progressed, loaded, newPhotosThisScan)
 			if idleScrolls >= 3 {
+				s.log("SelectBatch: 3 idle passes — declaring grid bottom hit")
 				res.HitGridBottom = true
 				break // truly exhausted
 			}
@@ -306,8 +370,11 @@ func (s *Scraper) SelectBatch(done map[string]bool, n int, progress func(selecte
 	if count, err := s.selectionCount(); err == nil {
 		res.ToolbarCount = count
 	} else {
+		s.log("SelectBatch: selectionCount error: %v", err)
 		res.ToolbarCount = -1
 	}
+	s.log("SelectBatch: done — clicked=%d toolbar=%d totalSeen=%d skippedDone=%d hitBottom=%v",
+		len(res.IDs), res.ToolbarCount, res.TotalSeen, res.SkippedDone, res.HitGridBottom)
 	return res, nil
 }
 
@@ -435,6 +502,7 @@ func (s *Scraper) SelectByIDs(ids []string, progress func(selected int)) (int, e
 	if len(ids) == 0 {
 		return 0, nil
 	}
+	s.log("SelectByIDs: looking for %d IDs in the grid (sample: %v)", len(ids), sampleIDs(ids, 3))
 	want := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		want[id] = true
@@ -520,6 +588,7 @@ func (s *Scraper) SelectByIDs(ids []string, progress func(selected int)) (int, e
 		}
 		if !progressed && !loaded {
 			idleScrolls++
+			s.log("SelectByIDs: idle pass %d/3 (selected=%d/%d)", idleScrolls, len(selected), len(want))
 			if idleScrolls >= 3 {
 				break
 			}
@@ -527,6 +596,7 @@ func (s *Scraper) SelectByIDs(ids []string, progress func(selected int)) (int, e
 			idleScrolls = 0
 		}
 	}
+	s.log("SelectByIDs: done — re-selected %d of %d IDs", len(selected), len(want))
 	return len(selected), nil
 }
 
@@ -658,9 +728,12 @@ func (s *Scraper) scrollForMore() (bool, error) {
 			return false, err
 		}
 		if after.Count > before.Count || after.Height > before.Height+50 {
+			s.log("scrollForMore: grew count %d→%d height %.0f→%.0f after %d polls",
+				before.Count, after.Count, before.Height, after.Height, i+1)
 			return true, nil
 		}
 	}
+	s.log("scrollForMore: no growth after 6 polls (count=%d height=%.0f)", before.Count, before.Height)
 	return false, nil
 }
 
@@ -669,6 +742,7 @@ func (s *Scraper) scrollForMore() (bool, error) {
 // wants to keep the grid clear of already-downloaded photos. The trashed
 // photos remain recoverable from Google Photos' Trash for 60 days.
 func (s *Scraper) TrashSelection() error {
+	s.log("TrashSelection: starting (looking for trash button in toolbar)")
 	// Find the selection-toolbar trash button. The matcher is tiered so
 	// we don't accidentally hit Google Photos' sidebar "Trash" nav link
 	// (label = "Lixeira" / "Papelera" / "Trash"), which would navigate
@@ -731,9 +805,14 @@ func (s *Scraper) TrashSelection() error {
 	`
 	clicked, err := s.clickElementByJS(trashButtonJS)
 	if err != nil {
+		s.log("TrashSelection: trash button click error: %v", err)
 		return err
 	}
+	if clicked {
+		s.log("TrashSelection: clicked trash button via aria-label match")
+	}
 	if !clicked {
+		s.log("TrashSelection: trash button not found by aria — trying Shift+Delete shortcut")
 		// Fallback: the documented Google Photos shortcut for "delete
 		// selected" is Shift+Delete. Cheap to try; harmless if nothing
 		// is selected (Google ignores it).
@@ -755,7 +834,9 @@ func (s *Scraper) TrashSelection() error {
 			const r = d.getBoundingClientRect();
 			return r.width > 0 && r.height > 0;
 		})()`, &dialogOpen))
+		s.log("TrashSelection: after Shift+Delete dialogOpen=%v", dialogOpen)
 		if !dialogOpen {
+			s.log("TrashSelection: ABORT — no trash button and no dialog from shortcut. toolbar diag: %s", s.diagnoseToolbar())
 			return fmt.Errorf("trash button not found in selection toolbar — diag: %s", s.diagnoseToolbar())
 		}
 	}
@@ -827,7 +908,9 @@ func (s *Scraper) TrashSelection() error {
 	// Wait up to 8s, polling every 200ms.
 	dialogDeadline := time.Now().Add(8 * time.Second)
 	dialogAppeared := false
+	dialogPolls := 0
 	for time.Now().Before(dialogDeadline) {
+		dialogPolls++
 		if err := s.browserCtx.Err(); err != nil {
 			return err
 		}
@@ -836,12 +919,14 @@ func (s *Scraper) TrashSelection() error {
 			return err
 		}
 		if open {
+			s.log("TrashSelection: confirm dialog detected after %d polls", dialogPolls)
 			dialogAppeared = true
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	if !dialogAppeared {
+		s.log("TrashSelection: confirm dialog never appeared (polled %d times over 8s)", dialogPolls)
 		// Two cases land here:
 		//   (a) Google didn't show a confirm dialog this time (rare —
 		//       has happened on tiny selections in some UI versions).
@@ -859,12 +944,18 @@ func (s *Scraper) TrashSelection() error {
 		if err := s.browserCtx.Err(); err != nil {
 			return err
 		}
-		if _, err := s.clickElementByJS(confirmJS); err != nil {
+		clicked, err := s.clickElementByJS(confirmJS)
+		if err != nil {
+			s.log("TrashSelection: confirm click error attempt %d: %v", attempt, err)
 			return err
+		}
+		if attempt == 0 || attempt%3 == 0 {
+			s.log("TrashSelection: confirm-click attempt %d clicked=%v", attempt, clicked)
 		}
 		if attempt > 0 && attempt%5 == 0 {
 			// Periodic Enter press as a backup pathway in case our
 			// querySelector is missing the actual confirm button.
+			s.log("TrashSelection: pressing Enter as backup confirm (attempt %d)", attempt)
 			_ = chromedp.Run(s.browserCtx, chromedp.KeyEvent("\r"))
 		}
 		time.Sleep(400 * time.Millisecond)
@@ -873,11 +964,13 @@ func (s *Scraper) TrashSelection() error {
 			return err
 		}
 		if !stillOpen {
+			s.log("TrashSelection: confirm dialog dismissed after %d attempts", attempt+1)
 			break
 		}
 	}
 	// Give Google a moment to actually delete and refresh the grid.
 	time.Sleep(2 * time.Second)
+	s.log("TrashSelection: complete")
 	return nil
 }
 
@@ -932,6 +1025,7 @@ func (s *Scraper) toggleSelect(p photoInfo, withHover bool) error {
 		return err
 	}
 	if pt.X != 0 || pt.Y != 0 {
+		s.log("toggleSelect[%s]: strategy=elementFromPoint click=(%.0f,%.0f)", p.ID, pt.X, pt.Y)
 		return s.click(pt.X, pt.Y)
 	}
 
@@ -959,6 +1053,7 @@ func (s *Scraper) toggleSelect(p photoInfo, withHover bool) error {
 		return err
 	}
 	if pt.X != 0 || pt.Y != 0 {
+		s.log("toggleSelect[%s]: strategy=ariaCheckbox click=(%.0f,%.0f)", p.ID, pt.X, pt.Y)
 		return s.click(pt.X, pt.Y)
 	}
 
@@ -974,11 +1069,13 @@ func (s *Scraper) toggleSelect(p photoInfo, withHover bool) error {
 	})()`, p.ID)
 	if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(focusJS, &focused)); err == nil && focused {
 		if err := chromedp.Run(s.browserCtx, chromedp.KeyEvent("x")); err == nil {
+			s.log("toggleSelect[%s]: strategy=focus+x", p.ID)
 			return nil
 		}
 	}
 
 	// Strategy 4: blind corner click, last resort.
+	s.log("toggleSelect[%s]: strategy=blindCorner click=(%.0f,%.0f)", p.ID, p.X+14, p.Y+14)
 	return s.click(p.X+14, p.Y+14)
 }
 
@@ -1085,7 +1182,9 @@ func (s *Scraper) diagnoseAfterSelect() string {
 // virtualized DOM (often after a long trash sequence where Google hadn't
 // fully repaginated) rather than a genuinely empty library.
 func (s *Scraper) RefreshGrid(timeout time.Duration) error {
+	s.log("RefreshGrid: hard reload of photos.google.com")
 	if err := chromedp.Run(s.browserCtx, chromedp.Navigate("https://photos.google.com/")); err != nil {
+		s.log("RefreshGrid: navigate error: %v", err)
 		return fmt.Errorf("refresh navigate: %w", err)
 	}
 	// Give the SPA a moment to mount before waitForGrid starts polling;
@@ -1128,9 +1227,12 @@ func (s *Scraper) VerifyTrashed(ids []string, timeout time.Duration) ([]string, 
 		return remaining;
 	})()`, strings.Join(idLits, ","))
 
+	s.log("VerifyTrashed: polling for up to %s on %d IDs", timeout, len(ids))
 	deadline := time.Now().Add(timeout)
 	var remaining []string
+	iter := 0
 	for {
+		iter++
 		if err := s.browserCtx.Err(); err != nil {
 			return nil, err
 		}
@@ -1138,24 +1240,36 @@ func (s *Scraper) VerifyTrashed(ids []string, timeout time.Duration) ([]string, 
 			return nil, err
 		}
 		if len(remaining) == 0 {
+			s.log("VerifyTrashed: all %d IDs gone from grid after %d polls", len(ids), iter)
 			return nil, nil
 		}
 		if time.Now().After(deadline) {
+			s.log("VerifyTrashed: timeout — %d of %d IDs still in grid (sample: %v)",
+				len(remaining), len(ids), sampleIDs(remaining, 5))
 			return remaining, nil
 		}
 		time.Sleep(400 * time.Millisecond)
 	}
 }
 
+func sampleIDs(ids []string, n int) []string {
+	if len(ids) <= n {
+		return ids
+	}
+	return ids[:n]
+}
+
 // ClearSelection sends Escape to drop the current selection so the next batch
 // starts clean.
 func (s *Scraper) ClearSelection() error {
+	s.log("ClearSelection: pressing Escape and scrolling to top")
 	if err := chromedp.Run(s.browserCtx,
 		input.DispatchKeyEvent(input.KeyDown).
 			WithKey("Escape").WithCode("Escape").WithWindowsVirtualKeyCode(27),
 		input.DispatchKeyEvent(input.KeyUp).
 			WithKey("Escape").WithCode("Escape").WithWindowsVirtualKeyCode(27),
 	); err != nil {
+		s.log("ClearSelection: Escape key error: %v", err)
 		return err
 	}
 	// Scroll back to top so the next batch starts from a known position
@@ -1183,36 +1297,47 @@ func (s *Scraper) click(x, y float64) error {
 // Caller must have called SetupDownloads first so the resulting zip is
 // captured to disk.
 func (s *Scraper) TriggerBulkDownload() error {
+	s.log("TriggerBulkDownload: starting")
 	if err := s.requireSelection(); err != nil {
+		s.log("TriggerBulkDownload: requireSelection failed: %v", err)
 		return err
 	}
 
 	// Strategy 1: a directly-visible "Download" control in the toolbar.
 	if clicked, err := s.clickElementByJS(downloadDirectJS); err != nil {
+		s.log("TriggerBulkDownload: directDownload click error: %v", err)
 		return err
 	} else if clicked {
+		s.log("TriggerBulkDownload: clicked direct Download button (no kebab needed)")
 		return nil
 	}
+	s.log("TriggerBulkDownload: no direct Download button — falling back to kebab menu")
 
 	// Strategy 2: kebab (more options) → Download menu item.
 	opened, err := s.clickElementByJS(kebabJS)
 	if err != nil {
+		s.log("TriggerBulkDownload: kebab click error: %v", err)
 		return err
 	}
 	if !opened {
+		s.log("TriggerBulkDownload: kebab not found — diag: %s", s.diagnoseAfterSelect())
 		return fmt.Errorf("could not locate the more-options (kebab) button — diag: %s",
 			s.diagnoseAfterSelect())
 	}
+	s.log("TriggerBulkDownload: kebab clicked, waiting 700ms for menu")
 	time.Sleep(700 * time.Millisecond)
 
 	clicked, err := s.clickElementByJS(downloadMenuItemJS)
 	if err != nil {
+		s.log("TriggerBulkDownload: download menu item click error: %v", err)
 		return err
 	}
 	if !clicked {
+		s.log("TriggerBulkDownload: Download item missing in kebab menu — diag: %s", s.diagnoseAfterSelect())
 		return fmt.Errorf("opened kebab menu but could not find a Download item — diag: %s",
 			s.diagnoseAfterSelect())
 	}
+	s.log("TriggerBulkDownload: Download menu item clicked")
 	return nil
 }
 
@@ -1221,9 +1346,12 @@ func (s *Scraper) TriggerBulkDownload() error {
 func (s *Scraper) requireSelection() error {
 	ok, err := s.selectionVisible()
 	if err != nil {
+		s.log("requireSelection: selectionVisible error: %v", err)
 		return err
 	}
+	s.log("requireSelection: selectionVisible=%v", ok)
 	if !ok {
+		s.log("requireSelection: ABORT — toolbar not visible. diag: %s", s.diagnoseAfterSelect())
 		return errors.New("selection toolbar is not visible — selection didn't take, " +
 			"so there is nothing to download")
 	}
@@ -1347,6 +1475,7 @@ type DownloadEvent struct {
 // request, after deduping live-photo pairs / burst groups / shared items
 // it can't export. Returns -1 if no parseable toast appears within timeout.
 func (s *Scraper) ReadPreparingDownloadCount(timeout time.Duration) (int, error) {
+	s.log("ReadPreparingDownloadCount: polling for 'preparing N items' toast (timeout=%s)", timeout)
 	const js = `(() => {
 		const isVisible = (el) => {
 			const r = el.getBoundingClientRect();
@@ -1382,9 +1511,11 @@ func (s *Scraper) ReadPreparingDownloadCount(timeout time.Duration) (int, error)
 		}
 		var n int
 		if err := chromedp.Run(s.browserCtx, chromedp.Evaluate(js, &n)); err == nil && n >= 0 {
+			s.log("ReadPreparingDownloadCount: toast says %d items", n)
 			return n, nil
 		}
 		if time.Now().After(deadline) {
+			s.log("ReadPreparingDownloadCount: no parseable toast appeared within %s", timeout)
 			return -1, nil
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -1422,6 +1553,7 @@ func (s *Scraper) ApplyZoom(factor float64) error {
 // straight to outputDir without prompting. The actual progress tracking
 // is done by polling the directory in tui.go — see watchDownloads.
 func (s *Scraper) SetupDownloads(outputDir string) error {
+	s.log("SetupDownloads: setting browser download path to %s", outputDir)
 	return chromedp.Run(s.browserCtx,
 		browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllow).
 			WithDownloadPath(outputDir),

@@ -37,6 +37,10 @@ type model struct {
 	scraper  *Scraper
 	headless bool
 	logLines []string
+	// debugLog is an opened file under cfg.OutputDir/debug.log; every
+	// appended log line is also flushed here so a crashed run leaves a
+	// complete trace on disk for the user to share.
+	debugLog *os.File
 
 	scrolledCount int
 	selectedCount int
@@ -90,6 +94,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			if m.scraper != nil {
 				m.scraper.Close()
+			}
+			if m.debugLog != nil {
+				_ = m.debugLog.Close()
 			}
 			return m, tea.Quit
 		case "1":
@@ -263,7 +270,26 @@ func humanBytes(n int64) string {
 
 func (m *model) appendLog(line string) {
 	stamp := time.Now().Format("15:04:05")
-	m.logLines = append(m.logLines, fmt.Sprintf("[%s] %s", stamp, line))
+	formatted := fmt.Sprintf("[%s] %s", stamp, line)
+	m.logLines = append(m.logLines, formatted)
+	// Also persist to a debug log file. Open lazily on first call so we
+	// don't error out at model construction if the OutputDir doesn't yet
+	// exist (main.go normally creates it, but a custom OutputDir flag
+	// path could lag).
+	if m.debugLog == nil && m.cfg.OutputDir != "" {
+		path := filepath.Join(m.cfg.OutputDir, "debug.log")
+		// O_APPEND so re-runs accumulate in one trace; the user can rm
+		// it between sessions if they want a clean log.
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err == nil {
+			m.debugLog = f
+			fmt.Fprintf(f, "\n[%s] === gphotos-downloader debug log opened ===\n",
+				time.Now().Format("2006-01-02 15:04:05"))
+		}
+	}
+	if m.debugLog != nil {
+		fmt.Fprintln(m.debugLog, formatted)
+	}
 }
 
 func tail(s []string, n int) []string {
@@ -286,6 +312,14 @@ func (m *model) send(msg tea.Msg) {
 // m.program.Send.
 func (m *model) runFlow() {
 	m.scraper = NewScraper(m.cfg, m.headless)
+	// Forward chrome.go's internal debug stream into the TUI log + debug.log
+	// file so the user can see (and share back) exactly which strategy fired
+	// on each click, where a click ladder bailed, what the toolbar looked
+	// like when a matcher missed, etc.
+	m.scraper.Logger = func(line string) {
+		m.send(logMsg{line: "dbg: " + line})
+	}
+	m.send(logMsg{line: fmt.Sprintf("debug log: %s", filepath.Join(m.cfg.OutputDir, "debug.log"))})
 	if err := m.scraper.EnsureLoggedIn(5 * time.Minute); err != nil {
 		m.scraper.Close()
 		m.scraper = nil
