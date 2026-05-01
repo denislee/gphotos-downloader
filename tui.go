@@ -663,7 +663,20 @@ func (m *model) runFlow() {
 					m.send(logMsg{line: fmt.Sprintf("warn: trash attempt %d/%d failed: %v", attempt, maxTrashAttempts, err)})
 					continue
 				}
-				remaining, err := m.scraper.VerifyTrashed(pendingTrash, 8*time.Second)
+				// Wait for Google's "moving to trash" / "moved to trash"
+				// snackbar to fully clear before checking the grid. The
+				// server-side delete + DOM removal scales with batch size
+				// (200 photos can take 30s+); checking too early sees
+				// stale thumbnails and falsely reports "still in grid".
+				// The toast disappearing is the actual commit signal.
+				if err := m.scraper.WaitForTrashToastGone(90 * time.Second); err != nil {
+					m.send(logMsg{line: fmt.Sprintf("warn: waiting for trash toast: %v", err)})
+				}
+				// Verify timeout scales with batch size — Google still
+				// needs a moment after the toast clears to drop items
+				// from the virtualized grid.
+				verifyTimeout := 8*time.Second + time.Duration(len(pendingTrash))*100*time.Millisecond
+				remaining, err := m.scraper.VerifyTrashed(pendingTrash, verifyTimeout)
 				if err != nil {
 					lastTrashErr = err
 					m.send(logMsg{line: fmt.Sprintf("warn: post-trash check failed on attempt %d/%d: %v", attempt, maxTrashAttempts, err)})
@@ -685,15 +698,6 @@ func (m *model) runFlow() {
 				return
 			}
 			m.send(logMsg{line: fmt.Sprintf("batch %d: confirmed %d photos removed from grid", batchNum, len(trashIDs))})
-			// The "Movendo para a lixeira" snackbar stays visible for the
-			// duration of the server-side delete. Reloading or starting the
-			// next selection while it's still up races the delete and the
-			// new grid can come back showing stale thumbnails. Wait it out,
-			// then hard-reload so the next batch starts from a clean grid.
-			m.send(logMsg{line: fmt.Sprintf("batch %d: waiting for trash toast to clear before reloading", batchNum)})
-			if err := m.scraper.WaitForTrashToastGone(60 * time.Second); err != nil {
-				m.send(logMsg{line: fmt.Sprintf("warn: waiting for trash toast: %v", err)})
-			}
 			m.send(logMsg{line: fmt.Sprintf("batch %d: reloading photos.google.com before next selection", batchNum)})
 			if err := m.scraper.RefreshGrid(2 * time.Minute); err != nil {
 				m.send(logMsg{line: fmt.Sprintf("warn: post-trash reload failed: %v", err)})
@@ -780,6 +784,9 @@ func (m *model) watchDownloads(outputDir string) ([]string, error) {
 				continue
 			}
 			name := e.Name()
+			if !isDownloadArtifact(name) {
+				continue
+			}
 			info, err := e.Info()
 			if err != nil {
 				continue
@@ -892,6 +899,9 @@ func (m *model) recheckStable(outputDir string, sizes map[string]int64, snapshot
 				continue
 			}
 			name := e.Name()
+			if !isDownloadArtifact(name) {
+				continue
+			}
 			info, err := e.Info()
 			if err != nil {
 				continue
@@ -918,6 +928,15 @@ func (m *model) recheckStable(outputDir string, sizes map[string]int64, snapshot
 			return false, nil
 		}
 	}
+}
+
+// isDownloadArtifact returns true for files watchDownloads should track —
+// the bulk-download zips and Chrome's in-flight `.crdownload` partials.
+// Everything else in OutputDir (notably our own debug.log, which is
+// continuously appended to during a run) must be ignored or the watcher
+// will mistake the growing log for a download that never stabilizes.
+func isDownloadArtifact(name string) bool {
+	return strings.HasSuffix(name, ".zip") || strings.HasSuffix(name, ".crdownload")
 }
 
 func snapshotDir(dir string) (map[string]int64, error) {
